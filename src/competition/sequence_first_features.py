@@ -17,7 +17,11 @@ def _bool_from_mixed(s: pd.Series) -> np.ndarray:
     )
 
 
-def add_sequence_first_features(df: pd.DataFrame) -> pd.DataFrame:
+def add_sequence_first_features(
+    df: pd.DataFrame,
+    max_prev_events: int | None = None,
+    include_ultra_burst: bool = True,
+) -> pd.DataFrame:
     if len(df) == 0:
         return df
 
@@ -99,6 +103,11 @@ def add_sequence_first_features(df: pd.DataFrame) -> pd.DataFrame:
     max_amt_7d = np.zeros(n, dtype=np.float32)
     burst_10m_over_1h = np.zeros(n, dtype=np.float32)
     burst_1h_over_1d = np.zeros(n, dtype=np.float32)
+    cnt_1m = np.zeros(n, dtype=np.int32)
+    cnt_5m = np.zeros(n, dtype=np.int32)
+    cnt_30m = np.zeros(n, dtype=np.int32)
+    sum_amt_5m = np.zeros(n, dtype=np.float32)
+    burst_5m_over_1d = np.zeros(n, dtype=np.float32)
 
     is_first_seen_event_type = np.zeros(n, dtype=np.int8)
     is_first_seen_mcc = np.zeros(n, dtype=np.int8)
@@ -126,16 +135,32 @@ def add_sequence_first_features(df: pd.DataFrame) -> pd.DataFrame:
         if e - s > 1:
             dt_prev[s + 1 : e] = (t[1:] - t[:-1]).astype(np.float32)
 
+        left_1m = np.searchsorted(t, t - 60, side="left")
+        left_5m = np.searchsorted(t, t - 300, side="left")
         left_10m = np.searchsorted(t, t - 600, side="left")
+        left_30m = np.searchsorted(t, t - 1800, side="left")
         left_1h = np.searchsorted(t, t - 3600, side="left")
         left_1d = np.searchsorted(t, t - 86400, side="left")
         left_7d = np.searchsorted(t, t - 86400 * 7, side="left")
+        if max_prev_events is not None and max_prev_events > 0:
+            lower = np.maximum(idx - (max_prev_events - 1), 0)
+            left_1m = np.maximum(left_1m, lower)
+            left_5m = np.maximum(left_5m, lower)
+            left_10m = np.maximum(left_10m, lower)
+            left_30m = np.maximum(left_30m, lower)
+            left_1h = np.maximum(left_1h, lower)
+            left_1d = np.maximum(left_1d, lower)
+            left_7d = np.maximum(left_7d, lower)
+        cnt_1m_local = idx - left_1m + 1
+        cnt_5m_local = idx - left_5m + 1
         cnt_10m[s:e] = idx - left_10m + 1
+        cnt_30m_local = idx - left_30m + 1
         cnt_1h[s:e] = idx - left_1h + 1
         cnt_1d[s:e] = idx - left_1d + 1
         cnt_7d[s:e] = idx - left_7d + 1
 
         csum = np.cumsum(a, dtype=np.float64)
+        sum_amt_5m_local = csum - np.where(left_5m > 0, csum[left_5m - 1], 0)
         sum_amt_1d[s:e] = (csum - np.where(left_1d > 0, csum[left_1d - 1], 0)).astype(np.float32)
         sum_amt_7d[s:e] = (csum - np.where(left_7d > 0, csum[left_7d - 1], 0)).astype(np.float32)
         mean_amt_7d[s:e] = (sum_amt_7d[s:e] / np.maximum(cnt_7d[s:e], 1)).astype(np.float32)
@@ -152,6 +177,14 @@ def add_sequence_first_features(df: pd.DataFrame) -> pd.DataFrame:
 
         burst_10m_over_1h[s:e] = cnt_10m[s:e] / np.maximum(cnt_1h[s:e], 1)
         burst_1h_over_1d[s:e] = cnt_1h[s:e] / np.maximum(cnt_1d[s:e], 1)
+        if include_ultra_burst:
+            cnt_1m[s:e] = cnt_1m_local.astype(np.int32)
+            cnt_5m[s:e] = cnt_5m_local.astype(np.int32)
+            cnt_30m[s:e] = cnt_30m_local.astype(np.int32)
+            sum_amt_5m[s:e] = sum_amt_5m_local.astype(np.float32)
+            burst_5m_over_1d[s:e] = (cnt_5m_local / np.maximum(cnt_1d[s:e], 1)).astype(
+                np.float32
+            )
 
         seen_ev: set[str] = set()
         seen_mcc: set[str] = set()
@@ -246,6 +279,12 @@ def add_sequence_first_features(df: pd.DataFrame) -> pd.DataFrame:
     out["max_amt_7d"] = max_amt_7d
     out["burst_10m_over_1h"] = burst_10m_over_1h
     out["burst_1h_over_1d"] = burst_1h_over_1d
+    if include_ultra_burst:
+        out["rolling_count_1m"] = cnt_1m
+        out["rolling_count_5m"] = cnt_5m
+        out["rolling_count_30m"] = cnt_30m
+        out["sum_amt_5m"] = sum_amt_5m
+        out["burst_5m_over_1d"] = burst_5m_over_1d
 
     out["is_first_seen_event_type_for_customer"] = is_first_seen_event_type
     out["is_first_seen_mcc_for_customer"] = is_first_seen_mcc
@@ -270,4 +309,3 @@ def add_sequence_first_features(df: pd.DataFrame) -> pd.DataFrame:
     ).astype("float").fillna(-1).astype(np.int8)
 
     return out.sort_index()
-

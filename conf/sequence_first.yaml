@@ -7,7 +7,9 @@ paths:
 
 dataset:
   include_unlabeled: false
+  unlabeled_modulo: 1000
   reviewed_negative_weight: 1.0
+  unlabeled_weight: 0.1
 
 validation:
   n_folds: 4

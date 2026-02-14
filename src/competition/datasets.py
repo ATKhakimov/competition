@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from datetime import datetime
 
 import polars as pl
 
@@ -55,3 +56,25 @@ def build_test_frame(cfg: dict, max_rows: int | None = None) -> pl.DataFrame:
     if max_rows is not None:
         test_lf = test_lf.limit(max_rows)
     return with_time_and_amount_features(test_lf).collect(streaming=True)
+
+
+def build_train_week_frame_full(
+    cfg: dict,
+    week_start: datetime,
+    max_rows: int | None = None,
+) -> pl.DataFrame:
+    data_dir, train_glob, labels_path, _ = _paths(cfg)
+
+    train_events = pl.scan_parquet(str(data_dir / train_glob)).select(FEATURE_COLUMNS)
+    labels = pl.scan_parquet(str(labels_path)).select(["event_id", "target"])
+    final_cols = ["event_id", "target"] + [c for c in FEATURE_COLUMNS if c != "event_id"]
+
+    full = (
+        train_events.join(labels, on="event_id", how="left")
+        .with_columns(pl.col("target").fill_null(-1).cast(pl.Int32))
+        .select(final_cols)
+    )
+    full = with_time_and_amount_features(full).filter(pl.col("week_start") == pl.lit(week_start))
+    if max_rows is not None:
+        full = full.limit(max_rows)
+    return full.collect(streaming=True)
