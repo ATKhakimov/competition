@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Logs
+*.log
+
+# Competition data (very large)
+db/*.parquet
+db/*.csv
+
+# Artifacts: keep only submission files
+artifacts/*
+!artifacts/submission*.csv
+
+# Explicitly ignore run tracking and caches
+artifacts/runs/
+artifacts/cache/
+

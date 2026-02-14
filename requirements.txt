@@ -1,0 +1,45 @@
+# Core data stack
+numpy>=1.26
+scipy>=1.11
+pandas>=2.2
+polars>=1.20
+pyarrow>=16.0
+duckdb>=1.1
+pyyaml>=6.0
+tqdm>=4.66
+joblib>=1.4
+
+# ML / ranking
+scikit-learn>=1.5
+xgboost>=2.1
+lightgbm>=4.5
+catboost>=1.2
+
+# Graph & embeddings
+networkx>=3.3
+python-igraph>=0.11
+leidenalg>=0.10
+node2vec>=0.4.6
+gensim>=4.3
+
+# Experiment tracking / viz
+matplotlib>=3.9
+seaborn>=0.13
+rich>=13.9
+
+# Notebook / interactive
+jupyterlab>=4.2
+ipykernel>=6.29
+
+# Deep learning (for future graph embeddings/GNN stages)
+torch>=2.4
+torchvision>=0.19
+torchaudio>=2.4
+
+# Optional (install when moving to full PyG pipeline)
+# torch-geometric>=2.6
+# pyg-lib
+# torch-scatter
+# torch-sparse
+# torch-cluster
+# torch-spline-conv

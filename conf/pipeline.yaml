@@ -1,0 +1,38 @@
+paths:
+  data_dir: db
+  artifacts_dir: artifacts
+  train_glob: train_part_*.parquet
+  test_file: test.parquet
+  labels_file: train_labels.parquet
+
+dataset:
+  include_unlabeled: true
+  unlabeled_modulo: 1000
+  reviewed_negative_weight: 0.8
+  unlabeled_weight: 0.1
+  random_seed: 42
+
+validation:
+  n_folds: 4
+  min_train_weeks: 8
+  topk: [100, 500, 1000]
+
+model:
+  device: cuda
+  gpu_fallback_to_cpu: true
+  n_estimators: 500
+  learning_rate: 0.05
+  max_depth: 8
+  min_child_weight: 8.0
+  subsample: 0.85
+  colsample_bytree: 0.85
+  reg_lambda: 1.0
+  random_state: 42
+
+inference:
+  submission_name: submission_baseline.csv
+
+tracking:
+  runs_dir: artifacts/runs
+  save_oof: true
+  save_feature_importance: true
