@@ -129,6 +129,13 @@ python scripts/export_foundation_embeddings.py \
   --device cuda:0
 ```
 
+## Project Docs (MkDocs Material)
+```bash
+pip install -r requirements-docs.txt
+mkdocs serve -a 0.0.0.0:8000
+```
+Open: `http://127.0.0.1:8000`
+
 ## Monitoring
 
 ### Live training log

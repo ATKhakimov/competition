@@ -35,3 +35,4 @@ artifacts/*
 # Explicitly ignore run tracking and caches
 artifacts/runs/
 artifacts/cache/
+site/
