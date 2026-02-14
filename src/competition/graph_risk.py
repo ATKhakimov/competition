@@ -8,101 +8,154 @@ import pandas as pd
 
 
 @dataclass
-class RiskTable:
-    prior: float
-    token_risk: dict[str, dict[object, float]]
-    token_count: dict[str, dict[object, float]]
-    pair_risk: dict[tuple[str, str], dict[str, float]]
-    pair_count: dict[tuple[str, str], dict[str, float]]
+class OnlineGraphState:
+    prior_base: float
+    alpha: float
+    # (key_cols) -> (global_cnt, global_pos)
+    global_stats: dict[tuple[str, ...], tuple[float, float]]
+    # (key_cols) -> dict[key_tuple] = [cnt, pos, last_ts]
+    states: dict[tuple[str, ...], dict[tuple[object, ...], list[float]]]
 
 
-def _fit_token_table(
-    df: pd.DataFrame,
-    y: pd.Series,
-    col: str,
-    alpha: float,
-    sample_weight: pd.Series | None,
-    prior: float,
-) -> tuple[dict[object, float], dict[object, float]]:
-    tmp = pd.DataFrame({"key": df[col], "y": y})
+def _safe_val(v: object) -> object:
+    if pd.isna(v):
+        return "__NA__"
+    return v
+
+
+def _feature_prefix_name(key_cols: tuple[str, ...]) -> str:
+    return "ogr_" + "__".join(key_cols)
+
+
+def _weighted_prior(
+    df: pd.DataFrame, label_col: str, sample_weight: pd.Series | None
+) -> float:
+    labeled_mask = df[label_col] >= 0
+    if labeled_mask.sum() == 0:
+        return 0.5
+    y = (df.loc[labeled_mask, label_col] == 1).astype(np.float64).to_numpy()
     if sample_weight is None:
-        tmp["w"] = 1.0
-    else:
-        tmp["w"] = sample_weight.values
-    tmp["yw"] = tmp["y"] * tmp["w"]
-    grouped = tmp.groupby("key", dropna=False, observed=False).agg(
-        y_sum=("yw", "sum"), w_sum=("w", "sum")
-    )
-    risk = (grouped["y_sum"] + alpha * prior) / (grouped["w_sum"] + alpha)
-    return risk.to_dict(), grouped["w_sum"].to_dict()
+        return float(y.mean())
+    w = sample_weight.loc[labeled_mask].to_numpy(dtype=np.float64)
+    denom = float(w.sum())
+    if denom <= 0:
+        return 0.5
+    return float((y * w).sum() / denom)
 
 
-def _pair_key(df: pd.DataFrame, left: str, right: str) -> pd.Series:
-    return df[left].astype("string").fillna("<NULL>") + "|" + df[right].astype("string").fillna(
-        "<NULL>"
-    )
-
-
-def fit_risk_tables(
-    labeled_df: pd.DataFrame,
-    y: pd.Series,
-    token_cols: Iterable[str],
-    pair_cols: Iterable[tuple[str, str]],
-    alpha: float = 20.0,
-    sample_weight: pd.Series | None = None,
-) -> RiskTable:
-    prior = float(np.average(y, weights=sample_weight))
-    token_risk: dict[str, dict[object, float]] = {}
-    token_count: dict[str, dict[object, float]] = {}
-    for col in token_cols:
-        r, c = _fit_token_table(labeled_df, y, col, alpha, sample_weight, prior)
-        token_risk[col] = r
-        token_count[col] = c
-
-    pair_risk: dict[tuple[str, str], dict[str, float]] = {}
-    pair_count: dict[tuple[str, str], dict[str, float]] = {}
-    for left, right in pair_cols:
-        key = _pair_key(labeled_df, left, right)
-        tmp = pd.DataFrame({"k": key, "y": y})
-        if sample_weight is None:
-            tmp["w"] = 1.0
-        else:
-            tmp["w"] = sample_weight.values
-        tmp["yw"] = tmp["y"] * tmp["w"]
-        grouped = tmp.groupby("k", observed=False).agg(y_sum=("yw", "sum"), w_sum=("w", "sum"))
-        risk = (grouped["y_sum"] + alpha * prior) / (grouped["w_sum"] + alpha)
-        pair_risk[(left, right)] = risk.to_dict()
-        pair_count[(left, right)] = grouped["w_sum"].to_dict()
-
-    return RiskTable(
-        prior=prior,
-        token_risk=token_risk,
-        token_count=token_count,
-        pair_risk=pair_risk,
-        pair_count=pair_count,
-    )
-
-
-def apply_risk_tables(
+def build_online_graph_features(
     df: pd.DataFrame,
-    tables: RiskTable,
-    token_cols: Iterable[str],
-    pair_cols: Iterable[tuple[str, str]],
-) -> pd.DataFrame:
-    out = df.copy()
-    for col in token_cols:
-        mapped = out[col].astype("object").map(tables.token_risk[col])
-        out[f"risk_{col}"] = mapped.fillna(tables.prior).astype(float)
-        out[f"log_cnt_{col}"] = (
-            np.log1p(out[col].astype("object").map(tables.token_count[col]).fillna(0.0).astype(float))
-        )
+    keys: Iterable[tuple[str, ...]],
+    label_col: str,
+    time_col: str,
+    event_id_col: str,
+    mode: str,
+    prior: float,
+    alpha: float,
+    init_state: OnlineGraphState | None = None,
+    update_labeled_only: bool = True,
+    include_risk: bool = True,
+    include_count: bool = True,
+) -> tuple[pd.DataFrame, OnlineGraphState]:
+    if mode not in {"train", "valid", "test"}:
+        raise ValueError(f"Unsupported mode={mode}")
 
-    for left, right in pair_cols:
-        key = _pair_key(out, left, right)
-        out[f"risk_{left}_{right}"] = key.map(tables.pair_risk[(left, right)]).fillna(
-            tables.prior
-        )
-        out[f"log_cnt_{left}_{right}"] = np.log1p(
-            key.map(tables.pair_count[(left, right)]).fillna(0.0).astype(float)
-        )
-    return out
+    key_list = [tuple(k) for k in keys]
+    sort_df = df[[time_col, event_id_col]].copy()
+    sort_df["_idx"] = np.arange(len(df), dtype=np.int64)
+    sort_df = sort_df.sort_values([time_col, event_id_col], kind="mergesort")
+    order = sort_df["_idx"].to_numpy(dtype=np.int64)
+
+    n = len(df)
+    out = df.copy()
+    ts = out[time_col].to_numpy(dtype=np.float64)
+    labels = out[label_col].to_numpy(dtype=np.int32) if label_col in out.columns else None
+
+    if init_state is None:
+        states: dict[tuple[str, ...], dict[tuple[object, ...], list[float]]] = {
+            k: {} for k in key_list
+        }
+        state_prior_base = prior
+        state_alpha = alpha
+        global_stats: dict[tuple[str, ...], tuple[float, float]] = {
+            k: (0.0, 0.0) for k in key_list
+        }
+    else:
+        states = {k: dict(v) for k, v in init_state.states.items()}
+        for k in key_list:
+            states.setdefault(k, {})
+        state_prior_base = init_state.prior_base
+        state_alpha = init_state.alpha
+        global_stats = dict(init_state.global_stats)
+        for k in key_list:
+            global_stats.setdefault(k, (0.0, 0.0))
+
+    for key_cols in key_list:
+        pfx = _feature_prefix_name(key_cols)
+        cnt_prev = np.zeros(n, dtype=np.float32)
+        pos_prev = np.zeros(n, dtype=np.float32)
+        risk = np.zeros(n, dtype=np.float32)
+        tslast = np.full(n, -1.0, dtype=np.float32)
+        is_new = np.ones(n, dtype=np.int8)
+
+        key_values = [out[c].to_numpy() for c in key_cols]
+        d = states[key_cols]
+        global_cnt, global_pos = global_stats[key_cols]
+
+        for i in order:
+            key = tuple(_safe_val(v[i]) for v in key_values)
+            rec = d.get(key)
+            if rec is None:
+                c = 0.0
+                p = 0.0
+                last = None
+            else:
+                c, p, last = rec[0], rec[1], rec[2]
+
+            prior_cur = (
+                global_pos / global_cnt if global_cnt > 0.0 else state_prior_base
+            )
+            cnt_prev[i] = c
+            pos_prev[i] = p
+            risk[i] = (p + state_alpha * prior_cur) / (c + state_alpha)
+            if last is not None:
+                tslast[i] = float(ts[i] - last)
+                is_new[i] = 0
+
+            if mode != "train":
+                continue
+
+            do_update = True
+            if update_labeled_only and labels is not None:
+                do_update = labels[i] >= 0
+            if not do_update:
+                continue
+
+            c_new = c + 1.0
+            p_new = p + (1.0 if labels is not None and labels[i] == 1 else 0.0)
+            d[key] = [c_new, p_new, float(ts[i])]
+            global_cnt += 1.0
+            global_pos += 1.0 if labels is not None and labels[i] == 1 else 0.0
+
+        global_stats[key_cols] = (global_cnt, global_pos)
+
+        if include_count:
+            out[f"{pfx}_cnt_prev"] = cnt_prev
+            out[f"{pfx}_is_new"] = is_new
+            out[f"{pfx}_tslast_sec"] = tslast
+        if include_risk:
+            out[f"{pfx}_pos_prev"] = pos_prev
+            out[f"{pfx}_risk_smooth"] = risk
+
+    return out, OnlineGraphState(
+        prior_base=state_prior_base,
+        alpha=state_alpha,
+        global_stats=global_stats,
+        states=states,
+    )
+
+
+def fit_graph_prior(
+    df: pd.DataFrame, label_col: str, sample_weight: pd.Series | None = None
+) -> float:
+    return _weighted_prior(df, label_col=label_col, sample_weight=sample_weight)

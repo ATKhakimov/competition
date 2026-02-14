@@ -36,3 +36,8 @@ tracking:
   runs_dir: artifacts/runs
   save_oof: true
   save_feature_importance: true
+
+graph:
+  prior_mode: fixed
+  prior_base: 0.5
+  alpha: 20.0

@@ -21,7 +21,7 @@ if str(SRC) not in sys.path:
 
 from competition.datasets import build_test_frame, build_train_frame
 from competition.behavioral_features import add_sequence_features, load_or_build_pretrain_profile
-from competition.graph_risk import apply_risk_tables, fit_risk_tables
+from competition.graph_risk import build_online_graph_features, fit_graph_prior
 from competition.pipeline_config import load_config
 from competition.splits import rolling_week_folds
 
@@ -33,15 +33,6 @@ DROP_COLUMNS = {
     "week_start",
 }
 
-GRAPH_TOKEN_COLS = [
-    "mcc_code",
-    "event_type_nm",
-    "channel_indicator_sub_type",
-    "channel_indicator_type",
-    "timezone",
-    "operating_system_type",
-    "device_system_version",
-]
 GRAPH_PAIR_COLS = [
     ("customer_id", "mcc_code"),
     ("customer_id", "channel_indicator_sub_type"),
@@ -271,18 +262,51 @@ def _predict_proba(
     return model.predict_proba(x)[:, 1]
 
 
+def _resolve_unlabeled_mode(mode: str, cfg: dict) -> bool:
+    if mode == "config":
+        return bool(cfg["dataset"]["include_unlabeled"])
+    if mode == "true":
+        return True
+    if mode == "false":
+        return False
+    raise ValueError(f"Unsupported unlabeled mode: {mode}")
+
+
+def _resolve_graph_prior(cfg: dict, df: pd.DataFrame, w: pd.Series) -> tuple[float, float]:
+    graph_cfg = cfg.get("graph", {})
+    alpha = float(graph_cfg.get("alpha", 20.0))
+    mode = str(graph_cfg.get("prior_mode", "fixed")).lower()
+    if mode == "train_rate":
+        prior = fit_graph_prior(df, label_col="target", sample_weight=w)
+    else:
+        prior = float(graph_cfg.get("prior_base", 0.5))
+    return prior, alpha
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train temporal baseline and create submission.")
     parser.add_argument("--config", default="conf/pipeline.yaml", type=str)
     parser.add_argument("--run-name", default=None, type=str)
     parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default=None)
+    parser.add_argument("--use-unlabeled", choices=["config", "true", "false"], default="config")
     parser.add_argument("--max-labeled-rows", type=int, default=None)
     parser.add_argument("--max-unlabeled-rows", type=int, default=None)
     parser.add_argument("--max-test-rows", type=int, default=None)
     parser.add_argument("--disable-graph-risk", action="store_true")
+    parser.add_argument(
+        "--graph-risk-mode",
+        choices=["full", "count", "off"],
+        default="full",
+        help="full=risk+count, count=count-only, off=disabled",
+    )
+    parser.add_argument("--disable-sequence", action="store_true")
+    parser.add_argument("--disable-pretrain-profile", action="store_true")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+    include_unlabeled = _resolve_unlabeled_mode(args.use_unlabeled, cfg)
+    cfg["dataset"]["include_unlabeled"] = include_unlabeled
+
     artifacts_dir = Path(cfg["paths"]["artifacts_dir"])
     artifacts_dir.mkdir(parents=True, exist_ok=True)
     run_name = args.run_name or _run_id()
@@ -292,9 +316,18 @@ def main() -> None:
     requested_device = args.device or str(cfg["model"].get("device", "auto")).lower()
     runtime_device, has_cuda = _resolve_device(requested_device)
     allow_fallback = bool(cfg["model"].get("gpu_fallback_to_cpu", True)) and requested_device == "auto"
+    graph_risk_mode = "off" if args.disable_graph_risk else args.graph_risk_mode
+    graph_include_risk = graph_risk_mode == "full"
+    graph_include_count = graph_risk_mode in {"full", "count"}
+    use_sequence = not args.disable_sequence
+    use_pretrain_profile = not args.disable_pretrain_profile
     print(
         f"[device] requested={requested_device} resolved={runtime_device} "
         f"cuda_available={has_cuda}"
+    )
+    print(
+        f"[setup] graph_risk_mode={graph_risk_mode} sequence={use_sequence} "
+        f"pretrain_profile={use_pretrain_profile} include_unlabeled={include_unlabeled}"
     )
 
     print("[1/4] Building train frame...")
@@ -305,9 +338,12 @@ def main() -> None:
     )
     train_df = train_pl.to_pandas(use_pyarrow_extension_array=False)
     print(f"train rows={len(train_df):,}")
-    train_df = add_sequence_features(train_df)
-    pretrain_profile = load_or_build_pretrain_profile(cfg)
-    train_df = _merge_pretrain_profile(train_df, pretrain_profile)
+    if use_sequence:
+        train_df = add_sequence_features(train_df)
+    pretrain_profile = None
+    if use_pretrain_profile:
+        pretrain_profile = load_or_build_pretrain_profile(cfg)
+        train_df = _merge_pretrain_profile(train_df, pretrain_profile)
 
     _, cat_cols = _model_features(train_df)
     cat_maps = _fit_category_maps(train_df, cat_cols)
@@ -341,29 +377,37 @@ def main() -> None:
         train_part = train_df.loc[full_train_mask].copy()
         valid_part = train_df.loc[val_idx].copy()
 
-        if not args.disable_graph_risk:
-            labeled_in_train = train_part.loc[train_part["target"] >= 0]
-            y_labeled_in_train = (labeled_in_train["target"] == 1).astype(np.int8)
-            w_labeled_in_train = w.loc[labeled_in_train.index]
-            risk_tables = fit_risk_tables(
-                labeled_in_train,
-                y_labeled_in_train,
-                token_cols=GRAPH_TOKEN_COLS,
-                pair_cols=GRAPH_PAIR_COLS,
-                alpha=20.0,
-                sample_weight=w_labeled_in_train,
+        if graph_risk_mode != "off":
+            fold_prior, fold_alpha = _resolve_graph_prior(
+                cfg=cfg, df=train_part, w=w.loc[train_part.index]
             )
-            train_part = apply_risk_tables(
+            train_part, fold_state = build_online_graph_features(
                 train_part,
-                risk_tables,
-                token_cols=GRAPH_TOKEN_COLS,
-                pair_cols=GRAPH_PAIR_COLS,
+                keys=GRAPH_PAIR_COLS,
+                label_col="target",
+                time_col="event_ts",
+                event_id_col="event_id",
+                mode="train",
+                prior=fold_prior,
+                alpha=fold_alpha,
+                init_state=None,
+                update_labeled_only=True,
+                include_risk=graph_include_risk,
+                include_count=graph_include_count,
             )
-            valid_part = apply_risk_tables(
+            valid_part, _ = build_online_graph_features(
                 valid_part,
-                risk_tables,
-                token_cols=GRAPH_TOKEN_COLS,
-                pair_cols=GRAPH_PAIR_COLS,
+                keys=GRAPH_PAIR_COLS,
+                label_col="target",
+                time_col="event_ts",
+                event_id_col="event_id",
+                mode="valid",
+                prior=fold_prior,
+                alpha=fold_alpha,
+                init_state=fold_state,
+                update_labeled_only=True,
+                include_risk=graph_include_risk,
+                include_count=graph_include_count,
             )
 
         fold_feature_cols, _ = _model_features(train_part)
@@ -391,12 +435,20 @@ def main() -> None:
 
         valid_week_mask = week_col == val_week
         proxy_part = train_df.loc[valid_week_mask].copy()
-        if not args.disable_graph_risk:
-            proxy_part = apply_risk_tables(
+        if graph_risk_mode != "off":
+            proxy_part, _ = build_online_graph_features(
                 proxy_part,
-                risk_tables,
-                token_cols=GRAPH_TOKEN_COLS,
-                pair_cols=GRAPH_PAIR_COLS,
+                keys=GRAPH_PAIR_COLS,
+                label_col="target",
+                time_col="event_ts",
+                event_id_col="event_id",
+                mode="valid",
+                prior=fold_prior,
+                alpha=fold_alpha,
+                init_state=fold_state,
+                update_labeled_only=True,
+                include_risk=graph_include_risk,
+                include_count=graph_include_count,
             )
         x_proxy = proxy_part[fold_feature_cols]
         y_proxy = y.loc[valid_week_mask]
@@ -473,27 +525,41 @@ def main() -> None:
     print("[3/4] Building final train/test matrices...")
     test_pl = build_test_frame(cfg, max_rows=args.max_test_rows)
     test_df = test_pl.to_pandas(use_pyarrow_extension_array=False)
-    test_df = _build_test_sequence_features(cfg, test_df)
-    test_df = _merge_pretrain_profile(test_df, pretrain_profile)
+    if use_sequence:
+        test_df = _build_test_sequence_features(cfg, test_df)
+    if use_pretrain_profile and pretrain_profile is not None:
+        test_df = _merge_pretrain_profile(test_df, pretrain_profile)
     test_df = _prepare_pandas(test_df, cat_cols, cat_maps)
 
-    if not args.disable_graph_risk:
-        labeled_full = train_df.loc[is_labeled]
-        y_labeled_full = (labeled_full["target"] == 1).astype(np.int8)
-        w_labeled_full = w.loc[labeled_full.index]
-        final_risk_tables = fit_risk_tables(
-            labeled_full,
-            y_labeled_full,
-            token_cols=GRAPH_TOKEN_COLS,
-            pair_cols=GRAPH_PAIR_COLS,
-            alpha=20.0,
-            sample_weight=w_labeled_full,
+    if graph_risk_mode != "off":
+        final_prior, final_alpha = _resolve_graph_prior(cfg=cfg, df=train_df, w=w)
+        train_df, final_state = build_online_graph_features(
+            train_df,
+            keys=GRAPH_PAIR_COLS,
+            label_col="target",
+            time_col="event_ts",
+            event_id_col="event_id",
+            mode="train",
+            prior=final_prior,
+            alpha=final_alpha,
+            init_state=None,
+            update_labeled_only=True,
+            include_risk=graph_include_risk,
+            include_count=graph_include_count,
         )
-        train_df = apply_risk_tables(
-            train_df, final_risk_tables, token_cols=GRAPH_TOKEN_COLS, pair_cols=GRAPH_PAIR_COLS
-        )
-        test_df = apply_risk_tables(
-            test_df, final_risk_tables, token_cols=GRAPH_TOKEN_COLS, pair_cols=GRAPH_PAIR_COLS
+        test_df, _ = build_online_graph_features(
+            test_df,
+            keys=GRAPH_PAIR_COLS,
+            label_col="target",
+            time_col="event_ts",
+            event_id_col="event_id",
+            mode="test",
+            prior=final_prior,
+            alpha=final_alpha,
+            init_state=final_state,
+            update_labeled_only=True,
+            include_risk=graph_include_risk,
+            include_count=graph_include_count,
         )
 
     feature_cols, _ = _model_features(train_df)
@@ -527,12 +593,19 @@ def main() -> None:
         "submission_path": str(submission_path),
         "config_path": args.config,
         "disable_graph_risk": bool(args.disable_graph_risk),
+        "graph_risk_mode": graph_risk_mode,
+        "use_sequence": use_sequence,
+        "use_pretrain_profile": use_pretrain_profile,
+        "include_unlabeled": include_unlabeled,
         "requested_device": requested_device,
         "runtime_device": runtime_device,
         "cuda_available": has_cuda,
         "train_rows": int(len(train_df)),
         "labeled_rows": int(is_labeled.sum()),
         "unlabeled_rows": int((~is_labeled).sum()),
+        "weight_sum_all": float(w.sum()),
+        "weight_sum_unlabeled": float(w.loc[~is_labeled].sum()),
+        "weight_unlabeled_ratio": float(w.loc[~is_labeled].sum() / max(float(w.sum()), 1e-9)),
         "cv_ap_labeled_mean": cv_mean,
         "cv_ap_labeled_std": cv_std,
         "cv_ap_proxy_mean": cv_proxy_mean,
@@ -565,6 +638,10 @@ def main() -> None:
                 "run_name": run_name,
                 "timestamp_utc": summary["timestamp_utc"],
                 "disable_graph_risk": bool(args.disable_graph_risk),
+                "graph_risk_mode": graph_risk_mode,
+                "use_sequence": use_sequence,
+                "use_pretrain_profile": use_pretrain_profile,
+                "include_unlabeled": include_unlabeled,
                 "runtime_device": runtime_device,
                 "train_rows": summary["train_rows"],
                 "labeled_rows": summary["labeled_rows"],

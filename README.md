@@ -28,6 +28,14 @@ pip install -r requirements.txt
 python scripts/train_baseline.py --config conf/pipeline.yaml
 ```
 
+### Sequence-first (no graph, recommended now)
+```bash
+python scripts/train_sequence_first.py \
+  --config conf/sequence_first.yaml \
+  --run-name seq_first_full_001 \
+  --device cuda | tee artifacts/seq_first_full_001.log
+```
+
 ### Named run (recommended)
 ```bash
 python scripts/train_baseline.py --config conf/pipeline.yaml --run-name exp_001
@@ -40,6 +48,18 @@ python scripts/train_baseline.py --config conf/pipeline.yaml --run-name exp_auto
 
 # Force GPU
 python scripts/train_baseline.py --config conf/pipeline.yaml --run-name exp_gpu --device cuda
+```
+
+### Research ablation flags
+```bash
+# Disable sequence and pretrain-profile features
+python scripts/train_baseline.py --config conf/pipeline.yaml --run-name exp_base --disable-sequence --disable-pretrain-profile
+
+# Graph risk modes: full | count | off
+python scripts/train_baseline.py --config conf/pipeline.yaml --run-name exp_cnt --graph-risk-mode count
+
+# Train on labeled only (red+yellow)
+python scripts/train_baseline.py --config conf/pipeline.yaml --run-name exp_labeled_only --use-unlabeled false
 ```
 
 ### Fast smoke run
@@ -59,6 +79,11 @@ python scripts/train_baseline.py --config conf/pipeline.yaml --disable-graph-ris
 ### Show run history
 ```bash
 python scripts/show_runs.py
+```
+
+### Online graph leakage checks
+```bash
+python scripts/check_graph_online.py --config conf/pipeline.yaml
 ```
 
 ## Monitoring
@@ -85,6 +110,7 @@ watch -n 1 nvidia-smi
 
 ## Files Added
 - `conf/pipeline.yaml`
+- `notebooks/research_ablation.ipynb`
 - `src/competition/datasets.py`
 - `src/competition/features.py`
 - `src/competition/graph_risk.py`

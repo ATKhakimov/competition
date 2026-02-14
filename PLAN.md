@@ -84,3 +84,10 @@
   - customer-token edges with recency/count weights.
   - exported graph artifacts for repeatable feature generation.
 - Iterate model selection on proxy metric first, then submit.
+
+## 10. Sequence-First Pivot (Current)
+- Primary training path moved to `sequence_first_no_graph`:
+  - labeled-only training (`red` vs `yellow`)
+  - transaction + device/session + strict prefix sequence features
+  - AP_lastday as primary offline selection metric
+- New entrypoint: `scripts/train_sequence_first.py` with config `conf/sequence_first.yaml`.
