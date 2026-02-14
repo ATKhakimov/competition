@@ -29,8 +29,9 @@ db/*.csv
 # Artifacts: keep only submission files
 artifacts/*
 !artifacts/submission*.csv
+!artifacts/reports/
+!artifacts/reports/**
 
 # Explicitly ignore run tracking and caches
 artifacts/runs/
 artifacts/cache/
-
