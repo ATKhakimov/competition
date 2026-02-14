@@ -17,7 +17,7 @@
 - Entry point: `scripts/train_sequence_first.py`.
 - Config: `conf/sequence_first.yaml`.
 - Training data: labeled only (`red + yellow`), no green in gradients.
-- Model: GPU XGBoost ranker-style scoring (`output_margin` used in submission).
+- Model family: XGBoost / CatBoost (current stable leader on honest full-week eval: CatBoost GPU).
 - Features:
   - Transaction context (time, amount transforms, base categoricals).
   - Device/session risk flags (target-free).
@@ -96,12 +96,12 @@ Run in this order unless blocked.
 - run row in `artifacts/runs/runs_index.csv`.
 
 ## 8) Near-Term Milestones
-1. Complete A + B + C (first pass) and pick strongest non-encoder setup.
-2. Complete D + E and lock best feature pack.
-3. Run F (label strategy) to lock production training set recipe.
-4. Run G only after tabular ceiling plateaus.
+1. Lock best tabular recipe (`CatBoost`, window, burst, label strategy) by honest `AP_all_events`.
+2. Finish Foundation pretrain (`Temporal Transformer`) and export embeddings.
+3. Add embedding features to downstream CatBoost and run A/B against current best tabular-only.
+4. Only after this decide whether to keep pure tabular or hybrid (`tabular + foundation embeddings`).
 
-## 10) Status Snapshot (Current)
+## 9) Status Snapshot (Updated 2026-02-14)
 - Completed A1 submission sanity tooling: `scripts/check_submission.py`.
 - Completed C first pass (window/burst ablations on 20k labeled).
 - Enabled strict `full_week_unsampled` offline evaluation (no `unlabeled_modulo` in validation slice).
@@ -116,11 +116,54 @@ Run in this order unless blocked.
   - `XGB`: `cv_ap_all_events_mean = 0.002066` (`seq_first_full_005_h20_burst_fullweek_eval_u001`)
   - `CatBoost GPU`: `cv_ap_all_events_mean = 0.003771` (`seq_first_full_006_h20_burst_fullweek_eval_u001_cat_v4`)
   - current leader: `CatBoost GPU`
+- Label strategy check (`history=20`, burst on, full-week eval, CatBoost):
+  - `R+Y+green(0.01)`: `cv_ap_all_events_mean = 0.003833` (`debug_gpu0_once`)
+  - `R+Y only`: `cv_ap_all_events_mean = 0.003970` (`debug_gpu1_labeled_only`)
+  - decision: prefer `R+Y only` for now.
+- D/E feature-pack ablation (new fingerprint/drift/session-fallback block):
+  - `pack ON`: `cv_ap_all_events_mean = 0.003458` (`seq_de_pack_on_gpu0`)
+  - `pack OFF`: `cv_ap_all_events_mean = 0.003732` (`seq_de_pack_off_gpu1`)
+  - decision: keep new D/E blocks disabled by default until redesign.
+- Latest tracked sequence run (MLflow-enabled sanity run):
+  - `seq_mlflow_cat_h20_labeled_gpu0_http`
+  - `cv_ap_all_events_mean = 0.003341`
 - Best leaderboard submission (public LB):
   - file: `artifacts/submissions/seq_first_full_006_h20_burst_fullweek_eval_u001_cat_v4__submission_sequence_first_sigmoid.csv`
   - score: `0.0693291616`
 
-## 9) Explicitly De-Prioritized
+## 10) Foundation Track (New)
+- Goal: pretrain `Transaction Foundation Encoder` on unlabeled sequences, then feed embeddings into downstream CatBoost.
+- Implemented components:
+  - data pipeline: `src/competition/foundation_data.py`
+  - model: `src/competition/foundation_model.py`
+  - pretrain entrypoint: `scripts/pretrain_foundation.py`
+  - embedding export: `scripts/export_foundation_embeddings.py`
+  - config: `conf/foundation_pretrain.yaml`
+- Current foundation recipe (v0):
+  - Backbone: `TemporalTransformer` (`d_model=512`, `layers=8`, `heads=8`, `seq_len=128`)
+  - Objectives: next-event (`event_type`, `channel`) + masked event modeling + `MSE(time_delta)`
+  - Data: `pretrain + train + pretest + test` (unlabeled pretrain stage, no label leakage)
+- Active run:
+  - name: `foundation_pretrain_gpu1_001`
+  - MLflow experiment: `competition-foundation` (id=`2`)
+  - run_id: `d3a49bae94a04f6a88e75224ecf5d20d`
+  - status at update time: `RUNNING` on GPU1
+- Next after pretrain:
+  1. export `event_embedding` and `customer_embedding` parquet.
+  2. join embeddings into sequence-first/baseline train tables.
+  3. compare `tabular-only` vs `tabular+embeddings` on honest `AP_all_events`.
+
+## 11) Tracking / Ops Notes
+- MLflow tracking integrated into:
+  - `scripts/train_sequence_first.py`
+  - `scripts/pretrain_foundation.py`
+- Important: file-based backend (`file:./artifacts/mlruns`) produced unstable `Run not found` errors in this environment.
+- Stable server command:
+  - `mlflow server --host 0.0.0.0 --port 5000 --workers 1 --backend-store-uri sqlite:///artifacts/mlflow.db --default-artifact-root file:./artifacts/mlruns_artifacts`
+- Current ETA visibility:
+  - no `tqdm`/explicit ETA yet; progress is logged by fold (tabular) or by `step=X/Y` (foundation pretrain).
+
+## 12) Explicitly De-Prioritized
 - Label-based graph-risk as primary signal.
 - Green-as-negative default training.
 - Random split validation.

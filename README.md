@@ -114,6 +114,21 @@ python scripts/check_graph_online.py --config conf/pipeline.yaml
 python scripts/check_submission.py --submission artifacts/submission_sequence_first.csv --test-file db/test.parquet
 ```
 
+## Foundation Pretrain (new)
+Pretrain temporal transformer encoder on unlabeled event streams:
+```bash
+python scripts/pretrain_foundation.py --config conf/foundation_pretrain.yaml --run-name fnd_pretrain_001 --device cuda:0
+```
+
+Export embeddings from a trained checkpoint:
+```bash
+python scripts/export_foundation_embeddings.py \
+  --config conf/foundation_pretrain.yaml \
+  --checkpoint artifacts/foundation/fnd_pretrain_001/checkpoint_final.pt \
+  --run-name fnd_export_001 \
+  --device cuda:0
+```
+
 ## Monitoring
 
 ### Live training log
@@ -136,6 +151,26 @@ watch -n 1 nvidia-smi
 - OOF proxy last-day preds: `artifacts/runs/<run_name>/oof_proxy_lastday_predictions.csv`
 - Feature importance: `artifacts/runs/<run_name>/feature_importance.csv`
 - All runs index: `artifacts/runs/runs_index.csv`
+
+### MLflow tracking
+Run local MLflow UI:
+```bash
+mlflow ui --host 0.0.0.0 --port 5000
+```
+
+Enable tracking in training:
+```bash
+python scripts/train_sequence_first.py \
+  --config conf/sequence_first.yaml \
+  --run-name exp_mlflow_001 \
+  --mlflow-uri file:./artifacts/mlruns \
+  --mlflow-experiment competition-sequence-first
+```
+
+Disable MLflow explicitly:
+```bash
+python scripts/train_sequence_first.py --config conf/sequence_first.yaml --disable-mlflow
+```
 
 ## Files Added
 - `conf/pipeline.yaml`

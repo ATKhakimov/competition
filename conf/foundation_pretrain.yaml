@@ -1,0 +1,52 @@
+paths:
+  data_dir: db
+  artifacts_dir: artifacts
+
+pretrain:
+  source_globs:
+    - pretrain_part_*.parquet
+    - train_part_*.parquet
+    - pretest.parquet
+    - test.parquet
+  seed: 42
+  shuffle_files: true
+
+  seq_len: 128
+  min_len: 8
+  stride: 32
+  mask_prob: 0.15
+
+  d_model: 512
+  n_heads: 8
+  n_layers: 8
+  ff_mult: 4
+  dropout: 0.1
+
+  batch_size: 32
+  grad_accum_steps: 2
+  num_workers: 4
+  max_steps: 4000
+  save_every: 500
+  log_every: 20
+
+  lr: 0.0002
+  weight_decay: 0.01
+  clip_grad_norm: 1.0
+  bf16: true
+  device: auto
+
+  w_next_event: 1.0
+  w_next_channel: 1.0
+  w_mlm_event: 1.0
+  w_mlm_channel: 1.0
+  w_next_delta: 0.2
+
+export:
+  source_globs:
+    - train_part_*.parquet
+    - test.parquet
+  min_len: 2
+  stride: 128
+  batch_size: 64
+  num_workers: 2
+

@@ -21,6 +21,9 @@ def add_sequence_first_features(
     df: pd.DataFrame,
     max_prev_events: int | None = None,
     include_ultra_burst: bool = True,
+    include_fingerprint_novelty: bool = True,
+    include_geo_lang_drift: bool = True,
+    include_session_fallback: bool = True,
 ) -> pd.DataFrame:
     if len(df) == 0:
         return df
@@ -40,6 +43,10 @@ def add_sequence_first_features(
     ch_s = _as_str(out["channel_indicator_sub_type"])
     ev_s = _as_str(out["event_type_nm"])
     sess_s = _as_str(out["session_id"])
+    lang_pair_s = (pd.Series(a_lang) + "|" + pd.Series(b_lang)).to_numpy()
+    weak_session = pd.Series(sess_s).str.lower().isin(
+        ["<null>", "null", "none", "nan", "unknown", "0", ""]
+    ).to_numpy(dtype=np.int8)
 
     out["device_fingerprint"] = (
         pd.Series(os_s)
@@ -114,8 +121,13 @@ def add_sequence_first_features(
     is_first_seen_channel_subtype = np.zeros(n, dtype=np.int8)
 
     is_new_device = np.zeros(n, dtype=np.int8)
+    fingerprint_cnt_prev = np.zeros(n, dtype=np.int32)
+    fingerprint_tslast = np.full(n, -1.0, dtype=np.float32)
     device_change_count_7d = np.zeros(n, dtype=np.int32)
     timezone_change_flag = np.zeros(n, dtype=np.int8)
+    timezone_change_count_7d = np.zeros(n, dtype=np.int32)
+    lang_change_flag = np.zeros(n, dtype=np.int8)
+    lang_change_count_7d = np.zeros(n, dtype=np.int32)
     battery_jump_flag = np.zeros(n, dtype=np.int8)
 
     session_event_index = np.zeros(n, dtype=np.int32)
@@ -123,6 +135,7 @@ def add_sequence_first_features(
     session_cnt_so_far = np.zeros(n, dtype=np.int32)
     session_amt_sum_so_far = np.zeros(n, dtype=np.float32)
     session_has_device_risk = np.zeros(n, dtype=np.int8)
+    session_fallback_30m_used = np.zeros(n, dtype=np.int8)
 
     boundaries = np.r_[0, np.flatnonzero(cust[1:] != cust[:-1]) + 1, n]
     for bi in range(len(boundaries) - 1):
@@ -192,9 +205,14 @@ def add_sequence_first_features(
         seen_fp: set[str] = set()
         last_ts_by_ch: dict[str, int] = {}
         last_ts_by_mcc: dict[str, int] = {}
+        cnt_by_fp: dict[str, int] = {}
+        last_ts_by_fp: dict[str, int] = {}
         change_ts: deque[int] = deque()
+        timezone_change_ts: deque[int] = deque()
+        lang_change_ts: deque[int] = deque()
         prev_fp = None
         prev_tz = None
+        prev_lang_pair = None
         prev_battery = None
 
         sess_start: dict[str, int] = {}
@@ -208,7 +226,8 @@ def add_sequence_first_features(
             ev = ev_s[j]
             fp = fp_s[j]
             cur_ts = ts[j]
-            cur_sess = sess_s[j]
+            raw_sess = sess_s[j]
+            cur_lang_pair = lang_pair_s[j]
 
             if ev not in seen_ev:
                 is_first_seen_event_type[j] = 1
@@ -231,6 +250,12 @@ def add_sequence_first_features(
             if fp not in seen_fp:
                 is_new_device[j] = 1
                 seen_fp.add(fp)
+            if include_fingerprint_novelty:
+                fingerprint_cnt_prev[j] = int(cnt_by_fp.get(fp, 0))
+                if fp in last_ts_by_fp:
+                    fingerprint_tslast[j] = float(cur_ts - last_ts_by_fp[fp])
+                cnt_by_fp[fp] = int(cnt_by_fp.get(fp, 0) + 1)
+                last_ts_by_fp[fp] = cur_ts
 
             if prev_fp is not None and fp != prev_fp:
                 change_ts.append(cur_ts)
@@ -241,13 +266,33 @@ def add_sequence_first_features(
 
             if prev_tz is not None and tz[j] != prev_tz:
                 timezone_change_flag[j] = 1
+                if include_geo_lang_drift:
+                    timezone_change_ts.append(cur_ts)
+            if include_geo_lang_drift:
+                while timezone_change_ts and timezone_change_ts[0] < cur_ts - 86400 * 7:
+                    timezone_change_ts.popleft()
+                timezone_change_count_7d[j] = len(timezone_change_ts)
             prev_tz = tz[j]
+
+            if include_geo_lang_drift:
+                if prev_lang_pair is not None and cur_lang_pair != prev_lang_pair:
+                    lang_change_flag[j] = 1
+                    lang_change_ts.append(cur_ts)
+                while lang_change_ts and lang_change_ts[0] < cur_ts - 86400 * 7:
+                    lang_change_ts.popleft()
+                lang_change_count_7d[j] = len(lang_change_ts)
+            prev_lang_pair = cur_lang_pair
 
             if prev_battery is not None and battery[j] >= 0 and prev_battery >= 0:
                 if abs(float(battery[j] - prev_battery)) >= 40:
                     battery_jump_flag[j] = 1
             prev_battery = battery[j]
 
+            if include_session_fallback and weak_session[j]:
+                cur_sess = f"__30m__{int(cur_ts // 1800)}"
+                session_fallback_30m_used[j] = 1
+            else:
+                cur_sess = raw_sess
             if cur_sess not in sess_start:
                 sess_start[cur_sess] = cur_ts
                 sess_cnt[cur_sess] = 0
@@ -291,8 +336,14 @@ def add_sequence_first_features(
     out["is_first_seen_channel_subtype_for_customer"] = is_first_seen_channel_subtype
 
     out["is_new_device_for_customer"] = is_new_device
+    out["is_new_fingerprint_for_customer"] = is_new_device
+    out["fingerprint_cnt_prev"] = fingerprint_cnt_prev
+    out["fingerprint_tslast_sec"] = fingerprint_tslast
     out["device_change_count_7d"] = device_change_count_7d
     out["timezone_change_flag"] = timezone_change_flag
+    out["timezone_change_count_7d"] = timezone_change_count_7d
+    out["lang_change_flag"] = lang_change_flag
+    out["lang_change_count_7d"] = lang_change_count_7d
     out["battery_jump_flag"] = battery_jump_flag
 
     out["session_event_index"] = session_event_index
@@ -300,6 +351,7 @@ def add_sequence_first_features(
     out["session_cnt_so_far"] = session_cnt_so_far
     out["session_amt_sum_so_far"] = session_amt_sum_so_far
     out["session_has_device_risk_flag"] = session_has_device_risk
+    out["session_fallback_30m_used"] = session_fallback_30m_used
 
     out["is_night"] = ((hour <= 5) | (hour >= 23)).astype(np.int8)
     out["amount_bucket"] = pd.cut(

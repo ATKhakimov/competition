@@ -26,6 +26,7 @@ gensim>=4.3
 matplotlib>=3.9
 seaborn>=0.13
 rich>=13.9
+mlflow>=2.16
 
 # Notebook / interactive
 jupyterlab>=4.2

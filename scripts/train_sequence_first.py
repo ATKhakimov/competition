@@ -26,6 +26,7 @@ from competition.datasets import build_test_frame, build_train_frame, build_trai
 from competition.pipeline_config import load_config
 from competition.sequence_first_features import add_sequence_first_features
 from competition.splits import rolling_week_folds
+from competition.mlflow_tracking import MlflowTracker
 
 
 DROP_COLUMNS = {"target", "event_dttm", "event_dt", "week_start"}
@@ -262,6 +263,13 @@ def main() -> None:
     parser.add_argument("--disable-ultra-burst", action="store_true")
     parser.add_argument("--disable-full-week-eval", action="store_true")
     parser.add_argument("--disable-pretrain-profile", action="store_true")
+    parser.add_argument("--disable-fingerprint-novelty", action="store_true")
+    parser.add_argument("--disable-geo-lang-drift", action="store_true")
+    parser.add_argument("--disable-session-fallback", action="store_true")
+    parser.add_argument("--disable-mlflow", action="store_true")
+    parser.add_argument("--mlflow-uri", default=None, type=str)
+    parser.add_argument("--mlflow-experiment", default="competition-sequence-first", type=str)
+    parser.add_argument("--mlflow-run-name", default=None, type=str)
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -281,6 +289,12 @@ def main() -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     submissions_dir = artifacts_dir / "submissions"
     submissions_dir.mkdir(parents=True, exist_ok=True)
+    tracker = MlflowTracker(
+        enabled=not args.disable_mlflow,
+        tracking_uri=args.mlflow_uri,
+        experiment_name=args.mlflow_experiment,
+        run_name=args.mlflow_run_name or run_name,
+    )
 
     requested_device = args.device or str(cfg["model"].get("device", "auto")).lower()
     runtime_device, has_cuda = _resolve_device(requested_device)
@@ -289,6 +303,9 @@ def main() -> None:
     max_prev_events = None if args.history_window_events == "all" else int(args.history_window_events)
     include_ultra_burst = not args.disable_ultra_burst
     use_full_week_eval = not args.disable_full_week_eval
+    include_fingerprint_novelty = not args.disable_fingerprint_novelty
+    include_geo_lang_drift = not args.disable_geo_lang_drift
+    include_session_fallback = not args.disable_session_fallback
 
     print(
         f"[device] requested={requested_device} resolved={runtime_device} "
@@ -301,7 +318,27 @@ def main() -> None:
         f"pretrain_profile={use_profile} "
         f"history_window_events={args.history_window_events} "
         f"ultra_burst={include_ultra_burst} "
+        f"fingerprint_novelty={include_fingerprint_novelty} "
+        f"geo_lang_drift={include_geo_lang_drift} "
+        f"session_fallback={include_session_fallback} "
         f"full_week_eval={use_full_week_eval}"
+    )
+    tracker.log_params(
+        {
+            "run_name": run_name,
+            "config_path": args.config,
+            "model_family": model_family,
+            "requested_device": requested_device,
+            "history_window_events": args.history_window_events,
+            "include_unlabeled": include_unlabeled,
+            "unlabeled_weight": float(cfg["dataset"].get("unlabeled_weight", 0.1)),
+            "use_pretrain_profile": use_profile,
+            "ultra_burst_enabled": include_ultra_burst,
+            "full_week_eval_unsampled": use_full_week_eval,
+            "fingerprint_novelty_enabled": include_fingerprint_novelty,
+            "geo_lang_drift_enabled": include_geo_lang_drift,
+            "session_fallback_enabled": include_session_fallback,
+        }
     )
 
     print("[1/4] Building train frame...")
@@ -317,6 +354,9 @@ def main() -> None:
         train_base_df.copy(),
         max_prev_events=max_prev_events,
         include_ultra_burst=include_ultra_burst,
+        include_fingerprint_novelty=include_fingerprint_novelty,
+        include_geo_lang_drift=include_geo_lang_drift,
+        include_session_fallback=include_session_fallback,
     )
     if use_profile:
         profile = load_or_build_pretrain_profile(cfg)
@@ -409,6 +449,9 @@ def main() -> None:
                 eval_base,
                 max_prev_events=max_prev_events,
                 include_ultra_burst=include_ultra_burst,
+                include_fingerprint_novelty=include_fingerprint_novelty,
+                include_geo_lang_drift=include_geo_lang_drift,
+                include_session_fallback=include_session_fallback,
             )
             if use_profile and profile is not None:
                 eval_feat = _merge_profile(eval_feat, profile)
@@ -470,6 +513,16 @@ def main() -> None:
             row[f"recall_lastday_top{k}"] = _recall_at_k(y_last, pred_last, k)
         fold_rows.append(row)
         pd.DataFrame(fold_rows).to_csv(run_dir / "fold_metrics_live.csv", index=False)
+        tracker.log_metrics(
+            {
+                "fold_ap_all_events": float(ap_all_events),
+                "fold_ap_labeled": float(ap_labeled),
+                "fold_ap_lastday": float(ap_last),
+                "fold_ap_seen": float(ap_seen),
+                "fold_ap_cold": float(ap_cold),
+            },
+            step=i,
+        )
         print(
             f"  fold={i} week={val_week.date()} AP_all_events={ap_all_events:.6f} "
             f"(sampled={ap_all_events_sampled:.6f}) "
@@ -512,6 +565,9 @@ def main() -> None:
         test_df,
         max_prev_events=max_prev_events,
         include_ultra_burst=include_ultra_burst,
+        include_fingerprint_novelty=include_fingerprint_novelty,
+        include_geo_lang_drift=include_geo_lang_drift,
+        include_session_fallback=include_session_fallback,
     )
     if use_profile and profile is not None:
         test_df = _merge_profile(test_df, profile)
@@ -594,6 +650,9 @@ def main() -> None:
         "unlabeled_weight": float(cfg["dataset"].get("unlabeled_weight", 0.1)),
         "history_window_events": args.history_window_events,
         "ultra_burst_enabled": include_ultra_burst,
+        "fingerprint_novelty_enabled": include_fingerprint_novelty,
+        "geo_lang_drift_enabled": include_geo_lang_drift,
+        "session_fallback_enabled": include_session_fallback,
         "train_rows": int(len(train_df)),
         "labeled_rows": int(is_labeled.sum()),
         "unlabeled_rows": int((~is_labeled).sum()),
@@ -633,6 +692,25 @@ def main() -> None:
     }
     with (run_dir / "summary.json").open("w", encoding="utf-8") as f:
         json.dump(_to_jsonable(summary), f, ensure_ascii=False, indent=2)
+    tracker.log_metrics(
+        {
+            "cv_ap_all_events_mean": cv_all_events_mean,
+            "cv_ap_all_events_std": cv_all_events_std,
+            "cv_ap_labeled_mean": cv_mean,
+            "cv_ap_labeled_std": cv_std,
+            "cv_ap_lastday_mean": cv_last_mean,
+            "cv_ap_seen_mean": cv_seen_mean,
+            "cv_ap_cold_mean": cv_cold_mean,
+            "submission_score_std": float(submission["predict"].std()),
+        }
+    )
+    tracker.set_tag("pipeline", "sequence_first_no_graph")
+    tracker.log_artifact(run_dir / "summary.json")
+    tracker.log_artifact(run_dir / "fold_metrics.csv")
+    tracker.log_artifact(run_dir / "fold_metrics_live.csv")
+    tracker.log_artifact(run_dir / "feature_importance.csv")
+    tracker.log_artifact(submission_path)
+    tracker.log_artifact(sigmoid_submission_path)
 
     index_path = runs_dir / "runs_index.csv"
     row = pd.DataFrame(
@@ -647,6 +725,9 @@ def main() -> None:
                 "full_week_eval_unsampled": use_full_week_eval,
                 "history_window_events": args.history_window_events,
                 "ultra_burst_enabled": include_ultra_burst,
+                "fingerprint_novelty_enabled": include_fingerprint_novelty,
+                "geo_lang_drift_enabled": include_geo_lang_drift,
+                "session_fallback_enabled": include_session_fallback,
                 "train_rows": summary["train_rows"],
                 "cv_ap_all_events_mean": cv_all_events_mean,
                 "cv_ap_all_events_sampled_mean": cv_all_events_sampled_mean,
@@ -666,6 +747,8 @@ def main() -> None:
         pd.concat([prev, row], ignore_index=True).to_csv(index_path, index=False)
     else:
         row.to_csv(index_path, index=False)
+    tracker.log_artifact(index_path)
+    tracker.end(status="FINISHED")
     print(f"Run artifacts: {run_dir}")
 
 
